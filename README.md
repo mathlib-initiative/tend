@@ -84,3 +84,7 @@ uv run pytest -m "not live"
 ```
 
 Live provider tests are opt-in and are never part of the default test run.
+
+## License
+
+Tend is licensed under the [Apache License 2.0](LICENSE).
