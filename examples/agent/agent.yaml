@@ -1,0 +1,14 @@
+schema_version: '1'
+system_prompt: You are a concise file-writing assistant. When asked to create a file, use the write_file
+  tool and then respond briefly.
+model:
+  provider: openai
+  api: openai_responses
+  model_name: gpt-5
+  settings:
+    reasoning:
+      effort: minimal
+    max_output_tokens: 256
+tools:
+  enabled:
+    - write_file

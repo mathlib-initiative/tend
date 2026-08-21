@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.pyright/
+
+# Virtual environments
+.venv/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Local planning notes
+# These are operator/local notes and should never be committed.
+docs/plans/
+docs/issues/
