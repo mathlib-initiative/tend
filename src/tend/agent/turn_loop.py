@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from asyncio import CancelledError
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
@@ -59,6 +60,7 @@ from tend.agent.tools.executor import (
 from tend.llm.context_estimation import (
     CONTEXT_ESTIMATE_METADATA_KEY,
     ContextEstimate,
+    RequestTokenEstimator,
     context_estimate_to_metadata,
     estimate_context,
     estimate_context_from_api_anchor,
@@ -80,6 +82,7 @@ from tend.llm.usage import (
 )
 
 _JSON_OBJECT_ADAPTER: TypeAdapter[JsonObject] = TypeAdapter(JsonObject)
+_log = logging.getLogger(__name__)
 _FINAL_RESULT_TOOL_NAME = "final_result"
 _OUTPUT_TOOL_KIND_METADATA_KEY = "tend_tool_kind"
 _OUTPUT_TOOL_KIND = "output"
@@ -162,7 +165,7 @@ async def run_turn(
         new_user_prompt=prompt,
         session_state=session_state,
     )
-    messages = _copy_model_messages(context.messages)
+    messages: list[ModelMessage] = _copy_model_messages(context.messages)
     tool_event_callback = _tool_event_callback(session, turn_id=turn_id)
 
     _append_turn_started(
@@ -186,7 +189,12 @@ async def run_turn(
     api_context_anchor: int | None = None
     api_anchor_new_messages: list[ModelMessage] = []
     forced_final_result_reasks = 0
-    force_final_result_next = False
+    force_final_result_next: bool = False
+    token_estimator: RequestTokenEstimator | None = (
+        model if isinstance(model, RequestTokenEstimator) else None
+    )
+    pending_context_estimate: ContextEstimate | None
+    compaction: _CompactionOutcome | None
 
     while True:
         if api_context_anchor is not None and runtime_config.usage.estimate_context_tokens:
@@ -195,6 +203,7 @@ async def run_turn(
                 new_messages=api_anchor_new_messages,
                 profile=model_profile,
                 config=runtime_config.usage.token_estimator,
+                token_estimator=token_estimator,
             )
             # Keep ``api_anchor_new_messages`` until the next response refreshes
             # the anchor. A retryable provider error re-enters this loop with the
@@ -202,6 +211,7 @@ async def run_turn(
             # ``anchor + 0`` and undercount the appended tool-result delta.
         else:
             pending_context_estimate = _estimate_context_for_request(
+                model=model,
                 messages=messages,
                 tool_schemas=tool_schemas,
                 runtime_config=runtime_config,
@@ -779,6 +789,7 @@ async def _maybe_compact_active_context(
 ) -> _CompactionOutcome | None:
     plan = plan_compaction(
         messages=messages,
+        token_estimator=model if isinstance(model, RequestTokenEstimator) else None,
         config=runtime_config.compaction,
         profile=model_profile,
         estimator_config=runtime_config.usage.token_estimator,
@@ -789,6 +800,15 @@ async def _maybe_compact_active_context(
     if not plan.enabled or not plan.trigger_reasons:
         return None
     if not plan.should_compact:
+        if plan.skip_reason == "insufficient token reduction":
+            _log.warning(
+                "Skipping compaction: %s (scale=%.3f, projected_tokens=%s, target_tokens=%s)",
+                plan.skip_reason,
+                plan.token_scale_factor,
+                plan.projected_tokens,
+                plan.token_target_tokens,
+            )
+            return None
         if not plan.char_triggered:
             # An anchor-only trigger can reflect provider-side thinking or other
             # overhead absent from the stored messages. With no char-budgeted
@@ -829,6 +849,7 @@ async def _compact_for_context_overflow_retry(
 ) -> _CompactionOutcome:
     plan = plan_compaction(
         messages=messages,
+        token_estimator=model if isinstance(model, RequestTokenEstimator) else None,
         config=runtime_config.compaction,
         profile=model_profile,
         estimator_config=runtime_config.usage.token_estimator,
@@ -879,6 +900,7 @@ async def _run_generic_compaction(
 ) -> _CompactionOutcome:
     plan = plan_compaction(
         messages=messages,
+        token_estimator=model if isinstance(model, RequestTokenEstimator) else None,
         config=runtime_config.compaction,
         profile=model_profile,
         estimator_config=runtime_config.usage.token_estimator,
@@ -918,6 +940,7 @@ async def _run_generic_compaction(
     result = result.model_copy(update={"usage": compaction_usage}, deep=True)
     compacted_messages = apply_compaction_result(messages, result)
     compacted_context_estimate = _estimate_context_for_request(
+        model=model,
         messages=compacted_messages,
         tool_schemas=tool_schemas,
         runtime_config=runtime_config,
@@ -1704,6 +1727,7 @@ def _compaction_reason(trigger_reasons: Sequence[object]) -> str:
 
 def _estimate_context_for_request(
     *,
+    model: ModelAdapter,
     messages: Sequence[ModelMessage],
     tool_schemas: Sequence[JsonObject],
     runtime_config: RuntimeConfig,
@@ -1718,6 +1742,7 @@ def _estimate_context_for_request(
         reasoning=reasoning,
         profile=model_profile,
         config=runtime_config.usage.token_estimator,
+        token_estimator=model if isinstance(model, RequestTokenEstimator) else None,
     )
 
 

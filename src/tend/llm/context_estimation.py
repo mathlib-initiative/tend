@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from math import ceil
-from typing import Annotated
+from typing import Annotated, Protocol, runtime_checkable
 
 from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
@@ -102,6 +102,59 @@ class ContextEstimateParts(StrictModel):
         """Return the sum of all estimate components."""
 
         return self.message_tokens + self.tool_schema_tokens + self.reasoning_setting_tokens
+
+
+class RequestTokenEstimate(StrictModel):
+    """Local token costs in request-message order, before API calibration.
+
+    Adapters should estimate the content they actually serialize, including
+    replayed continuation data, without counting duplicate metadata copies.
+    The fixed costs exclude all entries in ``message_tokens``.
+    """
+
+    message_tokens: list[_NonNegativeInt]
+    tool_schema_tokens: _NonNegativeInt = 0
+    reasoning_setting_tokens: _NonNegativeInt = 0
+
+    @property
+    def parts(self) -> ContextEstimateParts:
+        return ContextEstimateParts(
+            message_tokens=sum(self.message_tokens),
+            tool_schema_tokens=self.tool_schema_tokens,
+            reasoning_setting_tokens=self.reasoning_setting_tokens,
+        )
+
+
+@runtime_checkable
+class RequestTokenEstimator(Protocol):
+    """Optional, synchronous adapter capability; must not perform network I/O."""
+
+    def estimate_request_tokens(
+        self,
+        request: ModelRequest,
+        config: TokenEstimatorConfig,
+    ) -> RequestTokenEstimate: ...
+
+
+def estimate_request_tokens(
+    request: ModelRequest,
+    *,
+    config: TokenEstimatorConfig | None = None,
+    token_estimator: RequestTokenEstimator | None = None,
+) -> RequestTokenEstimate:
+    """Use an adapter's estimates when available, otherwise the generic fallback."""
+
+    config = config or TokenEstimatorConfig()
+    if token_estimator is not None:
+        estimate = token_estimator.estimate_request_tokens(request, config)
+        if len(estimate.message_tokens) != len(request.messages):
+            raise ValueError("token estimator must return one estimate per request message")
+        return estimate
+    return RequestTokenEstimate(
+        message_tokens=[estimate_message_tokens(message, config) for message in request.messages],
+        tool_schema_tokens=estimate_tool_schemas_tokens(request.tools, config),
+        reasoning_setting_tokens=estimate_reasoning_settings_tokens(request.reasoning, config),
+    )
 
 
 def estimate_text_tokens(text: str, config: TokenEstimatorConfig | None = None) -> int:
@@ -203,15 +256,15 @@ def estimate_context_parts(
     tools: Iterable[JsonObject] = (),
     reasoning: ReasoningSettings | None = None,
     config: TokenEstimatorConfig | None = None,
+    token_estimator: RequestTokenEstimator | None = None,
 ) -> ContextEstimateParts:
     """Estimate request context components before applying profile metadata."""
 
-    estimator = config or TokenEstimatorConfig()
-    return ContextEstimateParts(
-        message_tokens=estimate_messages_tokens(messages, estimator),
-        tool_schema_tokens=estimate_tool_schemas_tokens(tools, estimator),
-        reasoning_setting_tokens=estimate_reasoning_settings_tokens(reasoning, estimator),
-    )
+    return estimate_request_tokens(
+        ModelRequest(messages=list(messages), tools=list(tools), reasoning=reasoning),
+        config=config,
+        token_estimator=token_estimator,
+    ).parts
 
 
 def estimate_context(
@@ -222,6 +275,7 @@ def estimate_context(
     profile: ModelProfile | None = None,
     config: TokenEstimatorConfig | None = None,
     metadata: JsonObject | None = None,
+    token_estimator: RequestTokenEstimator | None = None,
 ) -> ContextEstimate:
     """Estimate active request context and include profile-window percentages."""
 
@@ -231,6 +285,7 @@ def estimate_context(
         tools=tools,
         reasoning=reasoning,
         config=estimator,
+        token_estimator=token_estimator,
     )
     return _estimate_from_parts(parts, profile=profile, config=estimator, metadata=metadata)
 
@@ -241,15 +296,20 @@ def estimate_model_request_context(
     profile: ModelProfile | None = None,
     config: TokenEstimatorConfig | None = None,
     metadata: JsonObject | None = None,
+    token_estimator: RequestTokenEstimator | None = None,
 ) -> ContextEstimate:
     """Estimate context tokens for a complete provider-neutral model request."""
 
-    return estimate_context(
-        messages=request.messages,
-        tools=request.tools,
-        reasoning=request.reasoning,
+    estimator = config or TokenEstimatorConfig()
+    parts = estimate_request_tokens(
+        request,
+        config=estimator,
+        token_estimator=token_estimator,
+    ).parts
+    return _estimate_from_parts(
+        parts,
         profile=profile,
-        config=config,
+        config=estimator,
         metadata=metadata,
     )
 
@@ -261,6 +321,7 @@ def estimate_context_from_api_anchor(
     profile: ModelProfile | None = None,
     config: TokenEstimatorConfig | None = None,
     metadata: JsonObject | None = None,
+    token_estimator: RequestTokenEstimator | None = None,
 ) -> ContextEstimate:
     """Estimate active context using API-reported totals as an anchor.
 
@@ -272,7 +333,13 @@ def estimate_context_from_api_anchor(
     captured by the anchor, so they don't need re-estimation.
     """
     estimator = config or TokenEstimatorConfig()
-    new_msg_tokens = estimate_messages_tokens(new_messages, estimator)
+    new_msg_tokens = sum(
+        estimate_request_tokens(
+            ModelRequest(messages=list(new_messages)),
+            config=estimator,
+            token_estimator=token_estimator,
+        ).message_tokens
+    )
     estimated_tokens = anchor_tokens + new_msg_tokens
     # All tokens are collapsed into message_tokens; tool_schema and reasoning
     # overhead are already baked into the anchor from the previous response.
@@ -378,10 +445,21 @@ def _estimate_json_tokens(value: JsonObject, config: TokenEstimatorConfig) -> in
     return estimate_text_tokens(text, config)
 
 
+def estimate_serialized_tokens(value: object, config: TokenEstimatorConfig) -> int:
+    """Estimate a model-visible JSON value, not an entire HTTP request envelope."""
+
+    return estimate_text_tokens(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+        config,
+    )
+
+
 __all__ = (
     "CONTEXT_ESTIMATE_METADATA_KEY",
     "ContextEstimate",
     "ContextEstimateParts",
+    "RequestTokenEstimate",
+    "RequestTokenEstimator",
     "TokenEstimatorConfig",
     "TokenEstimatorConfigOverrides",
     "context_estimate_from_metadata",
@@ -394,6 +472,8 @@ __all__ = (
     "estimate_messages_tokens",
     "estimate_model_request_context",
     "estimate_reasoning_settings_tokens",
+    "estimate_request_tokens",
+    "estimate_serialized_tokens",
     "estimate_text_tokens",
     "estimate_tool_call_tokens",
     "estimate_tool_schema_tokens",
