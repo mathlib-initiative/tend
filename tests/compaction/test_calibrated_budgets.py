@@ -341,3 +341,159 @@ async def test_turn_loop_does_not_recompact_every_request(estimator: RequestToke
             request.request_metadata.get("purpose") != "generic_compaction"
             for request in model.requests[index + 1 : index + 3]
         )
+
+
+@pytest.mark.parametrize("anchor", [None, 5500, 25_000])
+@pytest.mark.parametrize(
+    "estimator",
+    [
+        CustomEstimator(),
+        AnthropicMessagesAdapter(model_name="test"),
+        OpenAIResponsesAdapter(model_name="test"),
+    ],
+)
+def test_existing_summary_size_prevents_summary_only_compaction(
+    anchor: int | None,
+    estimator: RequestTokenEstimator,
+) -> None:
+    messages = [
+        AssistantMessage(
+            content=[
+                CompactionSummaryContent(
+                    summary=" foo" * 4000,
+                    covered_message_ids=["old"],
+                )
+            ]
+        ),
+        UserMessage(content=[TextContent(text="new " * 1500)]),
+    ]
+    plan = plan_compaction(
+        messages=messages,
+        config=CompactionConfig(
+            threshold_tokens=10_000, keep_recent_tokens=6000, target_tokens=4000
+        ),
+        token_estimator=estimator,
+        anchor_estimated_tokens=anchor,
+    )
+    assert not plan.should_compact
+    assert plan.skip_reason == "insufficient token reduction"
+    assert plan.projected_tokens is not None and plan.projected_tokens > 10_000
+    if anchor == 25_000:
+        assert plan.token_scale_factor > 1
+
+
+def test_large_summary_can_compact_additional_history_without_splitting_pending_call() -> None:
+    pending = assistant_message_from_tool_calls(
+        [
+            ToolCall(call_id="pending", tool_name="tool", arguments={}),
+        ]
+    )
+    messages = [
+        AssistantMessage(content=[CompactionSummaryContent(summary=" foo" * 4000)]),
+        UserMessage(content=[TextContent(text="old " * 1500)]),
+        pending,
+        UserMessage(content=[TextContent(text="recent")]),
+    ]
+    plan = plan_compaction(
+        messages=messages,
+        config=CompactionConfig(
+            threshold_tokens=10_000, keep_recent_tokens=6000, target_tokens=4000
+        ),
+    )
+    assert plan.should_compact
+    assert plan.compact_end_index == 2
+    assert plan.projected_tokens is not None and 8000 < plan.projected_tokens <= 9000
+    assert pending.message_id in plan.preserved_message_ids
+
+
+class LongSummaryModel(MeteredModel):
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request.model_copy(deep=True))
+        if request.request_metadata.get("purpose") == "generic_compaction":
+            # This provider counts each four-character word as one token. The
+            # returned text obeys the output limit but costs twice as much under
+            # the default local character estimator.
+            assert request.max_output_tokens == 4000
+            return ModelResponse(
+                assistant_message=AssistantMessage(content=[TextContent(text=" foo" * 4000)]),
+                usage=Usage(tokens=TokenUsage(input_tokens=1000, output_tokens=4000)),
+            )
+        self.normal_requests += 1
+        if self.normal_requests == 5:
+            return ModelResponse(
+                assistant_message=AssistantMessage(content=[TextContent(text="done")]),
+            )
+        return ModelResponse(
+            assistant_message=AssistantMessage(
+                content=[
+                    TextContent(
+                        text="new " * 1500 if self.normal_requests == 1 else "continue",
+                    )
+                ]
+            ),
+            tool_calls=[
+                ToolCall(
+                    call_id=f"call_{self.normal_requests}",
+                    tool_name="echo",
+                    arguments={"text": "ok"},
+                )
+            ],
+            usage=Usage(
+                tokens=TokenUsage(
+                    input_tokens=5500,
+                    output_tokens=1500 if self.normal_requests == 1 else 10,
+                )
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "estimator",
+    [
+        CustomEstimator(),
+        AnthropicMessagesAdapter(model_name="test"),
+        OpenAIResponsesAdapter(model_name="test"),
+    ],
+)
+async def test_oversized_summary_recovers_without_repeated_summary_only_rewrites(
+    estimator: RequestTokenEstimator,
+) -> None:
+    async def echo(_context: ToolContext, arguments: EchoArguments) -> str:
+        return arguments.text
+
+    model = LongSummaryModel(estimator)
+    agent = Agent(
+        "System.",
+        model=model,
+        tools=[
+            Tool.from_arguments_model(
+                name="echo",
+                description="Echo text.",
+                arguments_model=EchoArguments,
+                handler=echo,
+            )
+        ],
+    )
+    result = await agent.run_turn(
+        "old " * 4000,
+        config=RuntimeConfig(
+            compaction=CompactionConfig(
+                threshold_tokens=10_000,
+                keep_recent_tokens=6000,
+                target_tokens=4000,
+            )
+        ),
+    )
+    assert result.final_response == "done"
+    compactions = [
+        request
+        for request in model.requests
+        if request.request_metadata.get("purpose") == "generic_compaction"
+    ]
+    assert len(compactions) == 2
+    covered = compactions[1].request_metadata["covered_message_ids"]
+    assert isinstance(covered, list) and len(covered) > 1
+    assert all(
+        request.request_metadata.get("purpose") != "generic_compaction"
+        for request in model.requests[-3:]
+    )

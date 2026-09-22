@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from tend._common.errors import ConfigurationError
 from tend.llm.context_estimation import (
     TokenEstimatorConfig,
     estimate_context_from_api_anchor,
@@ -11,10 +12,12 @@ from tend.llm.context_estimation import (
 from tend.llm.history import assistant_message_from_response
 from tend.llm.models import (
     AssistantMessage,
+    DeveloperMessage,
     ModelRequest,
     ModelResponse,
     ReasoningContinuationMetadata,
     ReasoningMetadata,
+    SystemMessage,
     TextContent,
     UserMessage,
 )
@@ -134,3 +137,49 @@ def test_adapter_separates_fixed_costs_from_message_costs(
     after = adapter.estimate_request_tokens(with_tools, TokenEstimatorConfig())
     assert after.message_tokens == before.message_tokens
     assert after.tool_schema_tokens > before.tool_schema_tokens + 500
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        AssistantMessage(),
+        UserMessage(),
+        SystemMessage(),
+        DeveloperMessage(),
+        _assistant(provider="openai").model_copy(update={"content": []}),
+    ],
+)
+def test_anthropic_omitted_messages_have_zero_token_cost(
+    message: AssistantMessage | UserMessage | SystemMessage | DeveloperMessage,
+) -> None:
+    adapter = AnthropicMessagesAdapter(model_name="test")
+    request = ModelRequest(
+        messages=[
+            UserMessage(content=[TextContent(text="before")]),
+            message,
+            UserMessage(content=[TextContent(text="after")]),
+        ]
+    )
+    assert adapter.build_payload(request)["messages"] == [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "before"}, {"type": "text", "text": "after"}],
+        }
+    ]
+    estimates = estimate_request_tokens(request, token_estimator=adapter)
+    assert estimates.message_tokens[1] == 0
+    assert (
+        estimate_context_from_api_anchor(
+            anchor_tokens=100,
+            new_messages=[message],
+            token_estimator=adapter,
+        ).estimated_tokens
+        == 100
+    )
+    # Partial estimation may have no serialized messages. A complete request still may not.
+    assert estimate_request_tokens(
+        ModelRequest(messages=[message]),
+        token_estimator=adapter,
+    ).message_tokens == [0]
+    with pytest.raises(ConfigurationError, match="require at least one message"):
+        adapter.build_payload(ModelRequest(messages=[message]))

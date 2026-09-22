@@ -337,27 +337,47 @@ def _projected_tokens(
     estimator: TokenEstimatorConfig,
     token_estimator: RequestTokenEstimator | None,
 ) -> int:
-    # The output limit bounds summary text, but the inserted message also has
-    # a role, wrapper and covered IDs. Estimate those through the same adapter.
-    summary = AssistantMessage(
-        content=[
-            CompactionSummaryContent(
-                summary=" ",
-                covered_message_ids=[message.message_id for message in messages[start:end]],
-            )
+    covered_ids = [message.message_id for message in messages[start:end]]
+
+    def summary_cost(text: str) -> int:
+        summary = AssistantMessage(
+            content=[
+                CompactionSummaryContent(
+                    summary=text,
+                    covered_message_ids=covered_ids,
+                )
+            ]
+        )
+        return ceil(
+            estimate_request_tokens(
+                ModelRequest(messages=[summary]),
+                config=estimator,
+                token_estimator=token_estimator,
+            ).message_tokens[0]
+            * scale
+        )
+
+    # The provider's output limit is only a first projection: local estimates
+    # can count the resulting text as substantially more tokens. Once a summary
+    # exists, don't assume that replacing it under the same limit will shrink it.
+    # Measure its text in the replacement wrapper so stale covered IDs do not
+    # inflate the floor, and new covered IDs are still accounted for.
+    summary_budget = max(
+        [
+            target_tokens + summary_cost(" "),
+            *(
+                summary_cost(part.summary)
+                for message in messages[start:end]
+                for part in message.content
+                if isinstance(part, CompactionSummaryContent)
+            ),
         ]
     )
-    summary_overhead = estimate_request_tokens(
-        ModelRequest(messages=[summary]),
-        config=estimator,
-        token_estimator=token_estimator,
-    ).message_tokens[0]
     return (
         sum(calibrated_tokens[:start])
         + sum(calibrated_tokens[end:])
         + fixed_tokens
-        + target_tokens
-        + ceil(summary_overhead * scale)
+        + summary_budget
     )
 
 

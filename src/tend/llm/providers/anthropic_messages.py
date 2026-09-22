@@ -329,6 +329,8 @@ class AnthropicMessagesAdapter:
         )
 
         messages = _messages_from_model_messages(request.messages)
+        if not messages:
+            raise ConfigurationError("Anthropic Messages requests require at least one message")
         body: dict[str, object] = {
             "model": model_name,
             "max_tokens": max_tokens,
@@ -1358,8 +1360,6 @@ def _messages_from_model_messages(messages: Iterable[ModelMessage]) -> list[Json
                 role="user",
                 content=[_tool_result_block(message)],
             )
-    if not native_messages:
-        raise ConfigurationError("Anthropic Messages requests require at least one message")
     return native_messages
 
 
@@ -1516,6 +1516,8 @@ def _message_token_estimate(message: ModelMessage, config: TokenEstimatorConfig)
         payload: object = _system_text_from_messages([message])
     else:
         payload = _messages_from_model_messages([message])
+    if not payload:
+        return 0
     total = config.tokens_per_message + estimate_serialized_tokens(payload, config)
     if not isinstance(message, AssistantMessage):
         return total

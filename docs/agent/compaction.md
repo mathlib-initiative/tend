@@ -48,6 +48,13 @@ provide enough headroom, it skips with `insufficient token reduction` and the
 turn loop logs a warning. Forced provider-overflow recovery still attempts the
 smallest safe suffix even when the projection is pessimistic.
 
+The provider's summary output limit is not an exact bound in the local
+estimator's units. When replacing an existing summary, the planner also
+estimates that summary's observed text with the replacement's new wrapper and
+covered IDs, and uses the larger budget. A first summary can exceed its initial
+projection; the next plan must then remove enough additional history to make
+room, or skip, rather than repeatedly replacing only that oversized summary.
+
 Plan metadata includes `token_scale_factor`, `token_target_tokens`, and
 `projected_tokens`. Existing raw estimate fields remain unscaled; the legacy
 `char_triggered` field now describes the local estimator's trigger, including
