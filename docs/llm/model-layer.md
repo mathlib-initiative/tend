@@ -13,6 +13,29 @@ class ModelAdapter(Protocol):
 
 Tests use `tend.llm.testing.ScriptedModel` and `ScriptedJsonTransport` to avoid live network calls.
 
+Adapters can optionally implement `RequestTokenEstimator` from
+`tend.llm.context_estimation`:
+
+```python
+def estimate_request_tokens(
+    self, request: ModelRequest, config: TokenEstimatorConfig
+) -> RequestTokenEstimate: ...
+```
+
+This synchronous method must not make network calls. Its result contains one
+nonnegative token estimate per request message, in the same order, plus separate
+`tool_schema_tokens` and `reasoning_setting_tokens` fixed costs. It must also
+accept partial requests (including a single tool result or summary message),
+which the runtime uses to estimate additions and replacement summaries.
+
+Estimates should follow the adapter's serialization logic: include replayed
+continuations, but exclude metadata that is only stored locally. When opaque
+retained reasoning has a recorded token count, use that count in place of the
+serialized payload estimate, without adding duplicate metadata representations.
+Both built-in adapters implement this capability. Custom adapters without it
+continue to use the generic character estimator. API usage calibrates compaction
+budgets for all adapters; local estimates remain approximate.
+
 ## Messages and content
 
 Roles:

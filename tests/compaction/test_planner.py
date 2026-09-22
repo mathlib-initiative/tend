@@ -90,7 +90,7 @@ def test_no_compaction_below_threshold() -> None:
 def test_anchor_above_token_threshold_triggers_when_char_estimate_is_below() -> None:
     messages = [
         _system(),
-        _user("msg_old_user"),
+        _user("msg_old_user", text="u" * 5000),
         _assistant("msg_old_assistant"),
         _user("msg_recent_user"),
     ]
@@ -132,19 +132,19 @@ def test_absent_anchor_preserves_existing_planner_behavior() -> None:
 def test_char_estimate_above_token_threshold_triggers_when_anchor_is_below() -> None:
     messages = [
         _system(),
-        _user("msg_old_user"),
+        _user("msg_old_user", text="u" * 5000),
         _assistant("msg_old_assistant"),
         _user("msg_recent_user"),
     ]
 
     plan = plan_compaction(
         messages=messages,
-        config=_config(threshold_tokens=10, threshold_messages=100),
+        config=_config(threshold_tokens=14, threshold_messages=100),
         estimator_config=ESTIMATOR,
         anchor_estimated_tokens=1,
     )
 
-    assert plan.estimated_tokens > 10
+    assert plan.estimated_tokens > 14
     assert plan.anchor_estimated_tokens == 1
     assert plan.char_triggered is True
     assert plan.trigger_reasons == [CompactionTriggerReason.THRESHOLD_TOKENS]
@@ -160,7 +160,7 @@ def test_anchor_above_context_limit_triggers_when_char_estimate_is_below() -> No
     )
     messages = [
         _system(),
-        _user("msg_old_user"),
+        _user("msg_old_user", text="u" * 5000),
         _assistant("msg_old_assistant"),
         _user("msg_recent_user"),
     ]
@@ -198,7 +198,7 @@ def test_zero_anchor_does_not_trigger_below_threshold() -> None:
     assert plan.should_compact is False
 
 
-def test_huge_anchor_triggers_without_changing_char_estimate_semantics() -> None:
+def test_huge_anchor_skips_when_even_the_smallest_suffix_cannot_fit() -> None:
     messages = [
         _system(),
         _user("msg_old_user"),
@@ -217,7 +217,10 @@ def test_huge_anchor_triggers_without_changing_char_estimate_semantics() -> None
     assert plan.anchor_estimated_tokens == 10**9
     assert plan.char_triggered is False
     assert plan.trigger_reasons == [CompactionTriggerReason.THRESHOLD_TOKENS]
-    assert plan.should_compact is True
+    assert plan.should_compact is False
+    assert plan.skip_reason == "insufficient token reduction"
+    assert plan.projected_tokens is not None
+    assert plan.projected_tokens > 90
 
 
 def test_anchor_only_trigger_with_realistic_keep_budget_records_skipped_plan() -> None:
@@ -348,11 +351,11 @@ def test_reserve_and_keep_recent_budget_uses_context_window() -> None:
         provider_name="scripted_provider",
         model_name="scripted_model",
         api=ProviderApi.OPENAI_RESPONSES,
-        context_window=ContextWindow(tokens=10),
+        context_window=ContextWindow(tokens=100),
     )
     messages = [
         _system(),
-        _user("msg_one"),
+        _user("msg_one", text="u" * 110_000),
         _assistant("msg_two"),
         _user("msg_three"),
     ]
@@ -370,8 +373,8 @@ def test_reserve_and_keep_recent_budget_uses_context_window() -> None:
         estimator_config=ESTIMATOR,
     )
 
-    assert plan.context_limit_tokens == 7
-    assert plan.effective_threshold_tokens == 7
-    assert plan.effective_keep_recent_tokens == 5
+    assert plan.context_limit_tokens == 97
+    assert plan.effective_threshold_tokens == 97
+    assert plan.effective_keep_recent_tokens == 82
     assert plan.trigger_reasons == [CompactionTriggerReason.CONTEXT_WINDOW]
     assert plan.should_compact is True

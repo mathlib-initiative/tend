@@ -16,6 +16,12 @@ from tend.llm.config import (
     ProviderRuntimeConfig,
     resolve_agent_model_profile,
 )
+from tend.llm.context_estimation import (
+    RequestTokenEstimate,
+    TokenEstimatorConfig,
+    estimate_reasoning_settings_tokens,
+    estimate_serialized_tokens,
+)
 from tend.llm.history import ASSISTANT_REASONING_METADATA_KEY, assistant_tool_calls
 from tend.llm.models.messages import (
     AssistantMessage,
@@ -270,6 +276,28 @@ class AnthropicMessagesAdapter:
         for name in DEFAULT_SECRET_HEADER_NAMES:
             configured.append(name)
         return tuple(sorted({name.lower() for name in configured if name}))
+
+    def estimate_request_tokens(
+        self,
+        request: ModelRequest,
+        config: TokenEstimatorConfig,
+    ) -> RequestTokenEstimate:
+        """Estimate replayed content, using usage for opaque retained reasoning."""
+
+        return RequestTokenEstimate(
+            message_tokens=[
+                _message_token_estimate(message, config) for message in request.messages
+            ],
+            tool_schema_tokens=sum(
+                config.tokens_per_tool_schema
+                + estimate_serialized_tokens(_tool_payload(tool), config)
+                for tool in request.tools
+            ),
+            reasoning_setting_tokens=estimate_reasoning_settings_tokens(
+                self._resolve_reasoning(request),
+                config,
+            ),
+        )
 
     def build_payload(self, request: ModelRequest) -> JsonObject:
         """Translate a provider-neutral request into an Anthropic Messages body."""
@@ -1352,9 +1380,18 @@ def _append_native_message(
     messages.append(_json_object({"role": role, "content": content}))
 
 
-def _assistant_content_blocks(message: AssistantMessage) -> list[JsonObject]:
+def _assistant_content_blocks(
+    message: AssistantMessage,
+    *,
+    include_continuation: bool = True,
+) -> list[JsonObject]:
     blocks: list[JsonObject] = []
-    blocks.extend(_thinking_blocks_from_message_metadata(message))
+    blocks.extend(
+        _thinking_blocks_from_message_metadata(
+            message,
+            include_continuation=include_continuation,
+        )
+    )
     blocks.extend(_text_blocks(message))
     for tool_call in sorted(assistant_tool_calls(message), key=lambda call: call.order):
         blocks.append(_tool_use_block(tool_call))
@@ -1442,7 +1479,11 @@ def _tool_use_id_from_message_metadata(message: ToolResultMessage) -> str | None
     return None
 
 
-def _thinking_blocks_from_message_metadata(message: AssistantMessage) -> list[JsonObject]:
+def _thinking_blocks_from_message_metadata(
+    message: AssistantMessage,
+    *,
+    include_continuation: bool = True,
+) -> list[JsonObject]:
     blocks: list[JsonObject] = []
     raw_blocks = message.provider_metadata.get("anthropic_content_blocks")
     if isinstance(raw_blocks, list):
@@ -1451,17 +1492,57 @@ def _thinking_blocks_from_message_metadata(message: AssistantMessage) -> list[Js
             if block is not None:
                 blocks.append(block)
 
-    raw_reasoning = message.provider_metadata.get(ASSISTANT_REASONING_METADATA_KEY)
-    if isinstance(raw_reasoning, Mapping):
-        try:
-            reasoning = ReasoningMetadata.model_validate(raw_reasoning, strict=False)
-        except ValidationError:
-            return blocks
+    reasoning = _message_reasoning_metadata(message)
+    if include_continuation and reasoning is not None:
         for continuation in reasoning.provider_private_continuation:
             block = _thinking_block_from_continuation(continuation.model_dump(mode="python"))
             if block is not None:
                 blocks.append(block)
     return blocks
+
+
+def _message_reasoning_metadata(message: AssistantMessage) -> ReasoningMetadata | None:
+    raw_reasoning = message.provider_metadata.get(ASSISTANT_REASONING_METADATA_KEY)
+    if isinstance(raw_reasoning, Mapping):
+        try:
+            return ReasoningMetadata.model_validate(raw_reasoning, strict=False)
+        except ValidationError:
+            pass
+    return None
+
+
+def _message_token_estimate(message: ModelMessage, config: TokenEstimatorConfig) -> int:
+    if isinstance(message, SystemMessage | DeveloperMessage):
+        payload: object = _system_text_from_messages([message])
+    else:
+        payload = _messages_from_model_messages([message])
+    total = config.tokens_per_message + estimate_serialized_tokens(payload, config)
+    if not isinstance(message, AssistantMessage):
+        return total
+
+    reasoning = _message_reasoning_metadata(message)
+    if reasoning is None or not reasoning.reasoning_tokens:
+        return total
+    # Replace only the serialized continuation's estimate with its recorded
+    # usage. Raw thinking blocks, if also sent, remain separately accounted for.
+    continuation_blocks = [
+        block
+        for item in reasoning.provider_private_continuation
+        if (block := _thinking_block_from_continuation(item.model_dump(mode="python"))) is not None
+    ]
+    if not continuation_blocks:
+        return total
+    # Re-estimate the same wire shape without the continuation blocks. This
+    # avoids double-counting their text, signatures and encrypted representations.
+    without_continuation = _assistant_content_blocks(message, include_continuation=False)
+    return (
+        config.tokens_per_message
+        + estimate_serialized_tokens(
+            [{"role": "assistant", "content": without_continuation}],
+            config,
+        )
+        + reasoning.reasoning_tokens
+    )
 
 
 def _thinking_block_from_raw(value: object) -> JsonObject | None:

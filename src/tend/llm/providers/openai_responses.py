@@ -16,6 +16,11 @@ from tend.llm.config import (
     ProviderRuntimeConfig,
     resolve_agent_model_profile,
 )
+from tend.llm.context_estimation import (
+    RequestTokenEstimate,
+    TokenEstimatorConfig,
+    estimate_serialized_tokens,
+)
 from tend.llm.history import (
     ASSISTANT_MODEL_RESPONSE_ID_METADATA_KEY,
     ASSISTANT_PROVIDER_METADATA_KEY,
@@ -271,6 +276,34 @@ class OpenAIResponsesAdapter:
         for name in DEFAULT_SECRET_HEADER_NAMES:
             configured.append(name)
         return tuple(sorted({name.lower() for name in configured if name}))
+
+    def estimate_request_tokens(
+        self,
+        request: ModelRequest,
+        config: TokenEstimatorConfig,
+    ) -> RequestTokenEstimate:
+        """Estimate serialized input, excluding metadata that is not replayed."""
+
+        reasoning = self._resolve_reasoning(request)
+        reasoning_payload = _reasoning_payload(reasoning, self._profile) if reasoning else None
+        return RequestTokenEstimate(
+            message_tokens=[
+                config.tokens_per_message
+                + estimate_serialized_tokens(_input_items_from_messages([message]), config)
+                for message in request.messages
+            ],
+            tool_schema_tokens=sum(
+                config.tokens_per_tool_schema
+                + estimate_serialized_tokens(_function_tool_payload(tool, self._profile), config)
+                for tool in request.tools
+            ),
+            reasoning_setting_tokens=(
+                config.tokens_per_reasoning_settings
+                + estimate_serialized_tokens(reasoning_payload, config)
+                if reasoning_payload
+                else 0
+            ),
+        )
 
     def build_payload(self, request: ModelRequest) -> JsonObject:
         """Translate a provider-neutral request into an OpenAI Responses body."""

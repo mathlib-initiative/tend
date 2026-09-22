@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import pytest
+
 from tend.llm.context_estimation import (
     ContextEstimate,
+    RequestTokenEstimate,
     TokenEstimatorConfig,
     estimate_context,
     estimate_context_from_api_anchor,
+    estimate_request_tokens,
 )
 from tend.llm.models import (
     ContextWindow,
     ModelProfile,
+    ModelRequest,
     ProviderApi,
     TextContent,
     UserMessage,
@@ -86,3 +91,19 @@ def test_api_anchor_estimate_includes_profile_window_percentages() -> None:
     assert estimate.remaining_context_tokens == 1000
     assert estimate.context_usage_ratio == 0.5
     assert estimate.context_usage_percent == 50.0
+
+
+def test_adapter_estimates_must_correspond_to_request_messages() -> None:
+    class BrokenEstimator:
+        def estimate_request_tokens(
+            self,
+            request: ModelRequest,
+            config: TokenEstimatorConfig,
+        ) -> RequestTokenEstimate:
+            return RequestTokenEstimate(message_tokens=[])
+
+    with pytest.raises(ValueError, match="one estimate per request message"):
+        estimate_request_tokens(
+            ModelRequest(messages=[_message("message")]),
+            token_estimator=BrokenEstimator(),
+        )

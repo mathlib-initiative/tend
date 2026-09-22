@@ -207,7 +207,7 @@ async def test_api_anchor_triggers_pre_request_compaction_above_token_threshold(
     )
 
     with Session.create(tmp_path, session_id="sess_anchor_compact", sync_writes=False) as session:
-        result = await agent.run_turn("Use the tool.", session=session, config=config)
+        result = await agent.run_turn("Use the tool." * 2700, session=session, config=config)
         events = session.event_store.read_all()
 
     assert result.final_response == "done"
@@ -228,6 +228,7 @@ async def test_api_anchor_triggers_pre_request_compaction_above_token_threshold(
 async def test_anchor_only_trigger_with_realistic_budget_proceeds_without_compaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     captured_plans: list[CompactionPlan] = []
 
@@ -273,7 +274,9 @@ async def test_anchor_only_trigger_with_realistic_budget_proceeds_without_compac
     assert anchor_plan.char_triggered is False
     assert anchor_plan.trigger_reasons == [CompactionTriggerReason.THRESHOLD_TOKENS]
     assert anchor_plan.should_compact is False
-    assert anchor_plan.skip_reason == "no safe compaction range"
+    assert anchor_plan.skip_reason == "insufficient token reduction"
+    assert "Skipping compaction: insufficient token reduction" in caplog.text
+    assert "projected_tokens=" in caplog.text
 
 
 async def test_context_overflow_error_compacts_once_and_retries_safely(tmp_path: Path) -> None:

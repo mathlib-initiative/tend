@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from math import ceil
 from typing import Annotated
 
 from pydantic import Field, model_validator
@@ -19,19 +20,20 @@ from tend._common.types import JsonObject, StrictModel
 from tend.agent.config import CompactionConfig
 from tend.agent.context import assistant_tool_calls
 from tend.llm.context_estimation import (
+    RequestTokenEstimator,
     TokenEstimatorConfig,
-    estimate_context,
-    estimate_message_tokens,
+    estimate_request_tokens,
 )
 from tend.llm.models.messages import (
     AssistantMessage,
+    CompactionSummaryContent,
     DeveloperMessage,
     SystemMessage,
     UserMessage,
 )
 from tend.llm.models.profiles import ModelProfile
 from tend.llm.models.reasoning import ReasoningSettings
-from tend.llm.models.requests import ModelMessage
+from tend.llm.models.requests import ModelMessage, ModelRequest
 from tend.llm.models.tools import ToolResultMessage
 
 _NonNegativeInt = Annotated[int, Field(ge=0)]
@@ -74,6 +76,9 @@ class CompactionPlan(StrictModel):
     message_count: _NonNegativeInt
     estimated_tokens: _NonNegativeInt
     anchor_estimated_tokens: _NonNegativeInt | None = None
+    token_scale_factor: float = Field(default=1.0, ge=1)
+    token_target_tokens: _NonNegativeInt | None = None
+    projected_tokens: _NonNegativeInt | None = None
     message_token_estimate: _NonNegativeInt
     effective_threshold_tokens: _NonNegativeInt | None = None
     context_limit_tokens: _NonNegativeInt | None = None
@@ -126,37 +131,44 @@ def plan_compaction(
     reasoning: ReasoningSettings | None = None,
     anchor_estimated_tokens: int | None = None,
     force_context_overflow: bool = False,
+    token_estimator: RequestTokenEstimator | None = None,
 ) -> CompactionPlan:
     """Return a deterministic pre-request compaction plan for active messages.
 
     Triggering uses configured token/message thresholds plus the known model
     context window minus reserve tokens when a profile provides a window. When
     an API-anchored token estimate is available, token triggers use the larger
-    of it and the character-based estimate. Cut selection still uses per-message
-    character estimates to preserve a recent suffix, walking backward from the
-    newest message, and moves the cut point backward as needed to keep tool
-    pairs and unresolved tool calls in a safe state.
+    of it and the local estimate. Per-message and fixed costs are calibrated to
+    that same metric before selecting a suffix. Token-triggered plans must leave
+    10% headroom, including the summary, instructions and fixed request costs.
+    Tool pairs and unresolved calls remain protected. Forced overflow recovery
+    instead uses the smallest safe suffix, even if the projection is pessimistic.
     """
 
     estimator = estimator_config or TokenEstimatorConfig()
-    estimate = estimate_context(
-        messages=messages,
-        tools=tools,
-        reasoning=reasoning,
-        profile=profile,
+    estimate = estimate_request_tokens(
+        ModelRequest(messages=list(messages), tools=list(tools), reasoning=reasoning),
         config=estimator,
+        token_estimator=token_estimator,
     )
-    message_tokens = [estimate_message_tokens(message, estimator) for message in messages]
+    message_tokens = estimate.message_tokens
     message_token_estimate = sum(message_tokens)
+    local_total = estimate.parts.total_tokens
     context_limit_tokens = _context_limit_tokens(config, profile)
     effective_threshold_tokens = _effective_threshold_tokens(config, context_limit_tokens)
     trigger_estimated_tokens = max(
-        estimate.estimated_tokens,
+        local_total,
         anchor_estimated_tokens if anchor_estimated_tokens is not None else 0,
+    )
+    token_scale_factor = max(1.0, trigger_estimated_tokens / max(local_total, 1))
+    calibrated_tokens = [ceil(tokens * token_scale_factor) for tokens in message_tokens]
+    fixed_tokens = max(
+        ceil((local_total - message_token_estimate) * token_scale_factor),
+        trigger_estimated_tokens - sum(calibrated_tokens),
     )
     char_triggered = bool(
         _trigger_reasons(
-            estimated_tokens=estimate.estimated_tokens,
+            estimated_tokens=local_total,
             message_count=len(messages),
             config=config,
             context_limit_tokens=context_limit_tokens,
@@ -170,7 +182,25 @@ def plan_compaction(
     )
     if force_context_overflow:
         trigger_reasons = [*trigger_reasons, CompactionTriggerReason.CONTEXT_OVERFLOW]
+    token_target_tokens = (
+        effective_threshold_tokens * 9 // 10
+        if effective_threshold_tokens is not None
+        and trigger_estimated_tokens > effective_threshold_tokens
+        and not force_context_overflow
+        else None
+    )
     effective_keep_recent_tokens = _effective_keep_recent_tokens(config, profile)
+    if token_target_tokens is not None:
+        effective_keep_recent_tokens = min(
+            effective_keep_recent_tokens,
+            max(
+                token_target_tokens
+                - fixed_tokens
+                - config.target_tokens
+                - sum(calibrated_tokens[: leading_instruction_end(messages)]),
+                0,
+            ),
+        )
     if force_context_overflow:
         # Provider-reported overflow means our estimate/budget was too optimistic.
         # Preserve the minimum safe suffix and compact as aggressively as the
@@ -182,8 +212,10 @@ def plan_compaction(
         char_triggered=char_triggered,
         trigger_reasons=trigger_reasons,
         message_count=len(messages),
-        estimated_tokens=estimate.estimated_tokens,
+        estimated_tokens=local_total,
         anchor_estimated_tokens=anchor_estimated_tokens,
+        token_scale_factor=token_scale_factor,
+        token_target_tokens=token_target_tokens,
         message_token_estimate=message_token_estimate,
         effective_threshold_tokens=effective_threshold_tokens,
         context_limit_tokens=context_limit_tokens,
@@ -208,7 +240,7 @@ def plan_compaction(
     preferred_end = initial_recent_start(
         messages=messages,
         compactable_start=compact_start,
-        token_estimates=message_tokens,
+        token_estimates=calibrated_tokens,
         keep_recent_tokens=effective_keep_recent_tokens,
     )
     compact_end = find_safe_compaction_end(
@@ -216,7 +248,37 @@ def plan_compaction(
         compactable_start=compact_start,
         preferred_end=preferred_end,
     )
-    if compact_end <= compact_start:
+    projected_tokens: int | None = None
+    if token_target_tokens is not None:
+        # A tool boundary can expand the suffix beyond its budget. Try later
+        # safe cuts before giving up, always preserving the newest message.
+        for candidate in range(max(compact_end, compact_start + 1), len(messages)):
+            if not is_safe_compaction_range(messages, compact_start, candidate):
+                continue
+            projected_tokens = _projected_tokens(
+                messages=messages,
+                start=compact_start,
+                end=candidate,
+                calibrated_tokens=calibrated_tokens,
+                fixed_tokens=fixed_tokens,
+                target_tokens=config.target_tokens,
+                scale=token_scale_factor,
+                estimator=estimator,
+                token_estimator=token_estimator,
+            )
+            if projected_tokens <= token_target_tokens:
+                compact_end = candidate
+                break
+        else:
+            return _skipped_plan(
+                common.model_copy(update={"projected_tokens": projected_tokens}),
+                skip_reason=(
+                    "insufficient token reduction"
+                    if projected_tokens is not None
+                    else "no safe compaction range"
+                ),
+            )
+    elif compact_end <= compact_start:
         return _skipped_plan(common, skip_reason="no safe compaction range")
 
     compact_message_ids = [message.message_id for message in messages[compact_start:compact_end]]
@@ -237,8 +299,11 @@ def plan_compaction(
         trigger_reasons=trigger_reasons,
         skip_reason=None,
         message_count=len(messages),
-        estimated_tokens=estimate.estimated_tokens,
+        estimated_tokens=local_total,
         anchor_estimated_tokens=anchor_estimated_tokens,
+        token_scale_factor=token_scale_factor,
+        token_target_tokens=token_target_tokens,
+        projected_tokens=projected_tokens,
         message_token_estimate=message_token_estimate,
         effective_threshold_tokens=effective_threshold_tokens,
         context_limit_tokens=context_limit_tokens,
@@ -257,6 +322,42 @@ def plan_compaction(
             latest_user_index is not None
             and compact_start <= latest_user_index < compact_end < len(messages)
         ),
+    )
+
+
+def _projected_tokens(
+    *,
+    messages: Sequence[ModelMessage],
+    start: int,
+    end: int,
+    calibrated_tokens: Sequence[int],
+    fixed_tokens: int,
+    target_tokens: int,
+    scale: float,
+    estimator: TokenEstimatorConfig,
+    token_estimator: RequestTokenEstimator | None,
+) -> int:
+    # The output limit bounds summary text, but the inserted message also has
+    # a role, wrapper and covered IDs. Estimate those through the same adapter.
+    summary = AssistantMessage(
+        content=[
+            CompactionSummaryContent(
+                summary=" ",
+                covered_message_ids=[message.message_id for message in messages[start:end]],
+            )
+        ]
+    )
+    summary_overhead = estimate_request_tokens(
+        ModelRequest(messages=[summary]),
+        config=estimator,
+        token_estimator=token_estimator,
+    ).message_tokens[0]
+    return (
+        sum(calibrated_tokens[:start])
+        + sum(calibrated_tokens[end:])
+        + fixed_tokens
+        + target_tokens
+        + ceil(summary_overhead * scale)
     )
 
 
@@ -446,6 +547,9 @@ class _CommonPlanFields(StrictModel):
     message_count: _NonNegativeInt
     estimated_tokens: _NonNegativeInt
     anchor_estimated_tokens: _NonNegativeInt | None
+    token_scale_factor: float = Field(ge=1)
+    token_target_tokens: _NonNegativeInt | None
+    projected_tokens: _NonNegativeInt | None = None
     message_token_estimate: _NonNegativeInt
     effective_threshold_tokens: _NonNegativeInt | None
     context_limit_tokens: _NonNegativeInt | None
@@ -468,6 +572,9 @@ def _skipped_plan(common: _CommonPlanFields, *, skip_reason: str | None) -> Comp
         message_count=common.message_count,
         estimated_tokens=common.estimated_tokens,
         anchor_estimated_tokens=common.anchor_estimated_tokens,
+        token_scale_factor=common.token_scale_factor,
+        token_target_tokens=common.token_target_tokens,
+        projected_tokens=common.projected_tokens,
         message_token_estimate=common.message_token_estimate,
         effective_threshold_tokens=common.effective_threshold_tokens,
         context_limit_tokens=common.context_limit_tokens,
