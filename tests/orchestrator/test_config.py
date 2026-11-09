@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from pathlib import Path
 
@@ -366,3 +367,91 @@ def test_config_rejects_blank_merge_target_branch() -> None:
             entrypoint=Path("./repo"),
             merge_target_branch=" ",
         )
+
+
+def test_seed_worktree_build_paths_defaults_to_root_lake_build() -> None:
+    project_config = AsyncOrchestratorProjectConfig(entrypoint=Path("./repo"))
+    runtime_config = AsyncOrchestratorConfig(root=Path("./orch"), entrypoint=Path("./repo"))
+
+    assert project_config.seed_worktree_build_paths == (".lake/build",)
+    assert runtime_config.seed_worktree_build_paths == (".lake/build",)
+
+
+def test_seed_worktree_build_paths_load_from_yaml_and_reach_runtime_config(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "entrypoint: ./repo\n"
+        "seed_worktree_build_paths:\n"
+        "- TauCeti/.lake/build\n"
+        "- sources/foo/.lake/build\n",
+        encoding="utf-8",
+    )
+
+    project_config = read_config_model(
+        config_path,
+        AsyncOrchestratorProjectConfig,
+        kind="async orchestrator config",
+    )
+    runtime_config = project_config.to_runtime_config(root=Path("./orch"))
+    from_paths_config = AsyncOrchestratorConfig.from_paths(
+        root="./orch",
+        entrypoint="./repo",
+        seed_worktree_build_paths=["TauCeti/.lake/build", "sources/foo/.lake/build"],
+    )
+
+    expected = ("TauCeti/.lake/build", "sources/foo/.lake/build")
+    assert project_config.seed_worktree_build_paths == expected
+    assert runtime_config.seed_worktree_build_paths == expected
+    assert from_paths_config.seed_worktree_build_paths == expected
+
+
+@pytest.mark.parametrize(
+    ("paths", "message"),
+    [
+        ((), "at least one path"),
+        (("",), "must not be blank"),
+        ((" ",), "must not be blank"),
+        (("/abs/.lake/build",), "relative to the worktree root"),
+        (("../outside/.lake/build",), "'.' or '..' components"),
+        (("TauCeti/../.lake/build",), "'.' or '..' components"),
+        (("./TauCeti/.lake/build",), "'.' or '..' components"),
+        (("TauCeti\\.lake\\build",), "not backslashes"),
+        (("TauCeti//.lake/build",), "normalized"),
+        (("TauCeti/.lake/build/",), "normalized"),
+        (("TauCeti/.lake/build", "TauCeti/.lake/build"), "unique"),
+        (("TauCeti/.lake", "TauCeti/.lake/build"), "ancestor"),
+        (("sources/foo/.lake/build", "sources"), "ancestor"),
+    ],
+)
+def test_seed_worktree_build_paths_rejects_invalid_entries(
+    paths: tuple[str, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=re.escape(message)):
+        AsyncOrchestratorProjectConfig(
+            entrypoint=Path("./repo"),
+            seed_worktree_build_paths=paths,
+        )
+    with pytest.raises(ValidationError, match=re.escape(message)):
+        AsyncOrchestratorConfig.from_paths(
+            root="./orch",
+            entrypoint="./repo",
+            seed_worktree_build_paths=paths,
+        )
+
+
+def test_seed_worktree_build_paths_accepts_sibling_prefix_names() -> None:
+    """``foo`` and ``foo-bar/...`` share a string prefix but not a path prefix."""
+
+    config = AsyncOrchestratorProjectConfig(
+        entrypoint=Path("./repo"),
+        seed_worktree_build_paths=(".lake/build", ".lake/build-extra", "TauCeti/.lake/build"),
+    )
+
+    assert config.seed_worktree_build_paths == (
+        ".lake/build",
+        ".lake/build-extra",
+        "TauCeti/.lake/build",
+    )

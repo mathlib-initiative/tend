@@ -1646,6 +1646,118 @@ async def test_init_defaults_task_only_build_skip_off(tmp_path: Path) -> None:
     assert config.skip_build_validation_for_task_only_merges is False
 
 
+async def test_init_seed_worktree_build_paths_round_trip_into_config_and_run(
+    tmp_path: Path,
+) -> None:
+    """Repeated ``--seed-worktree-build-path`` replaces the default list and is
+    threaded through ``config.yaml`` into the runtime config ``run`` builds."""
+
+    seen_configs: list[AsyncOrchestratorConfig] = []
+    root = tmp_path / "orch"
+    entrypoint = tmp_path / "repo"
+    entrypoint.mkdir()
+
+    class RecordingOrchestrator:
+        def __init__(self, config: AsyncOrchestratorConfig) -> None:
+            self.config = config
+
+        async def run(self) -> AsyncOrchestratorRunResult:
+            seen_configs.append(self.config)
+            return AsyncOrchestratorRunResult(
+                root=self.config.root,
+                entrypoint=self.config.entrypoint,
+            )
+
+    exit_code = await run_cli(
+        [
+            "init",
+            "--root",
+            str(root),
+            "--entrypoint",
+            str(entrypoint),
+            "--mirror-enabled",
+            "--seed-worktree-build",
+            "--seed-worktree-build-path",
+            "TauCeti/.lake/build",
+            "--seed_worktree_build_path",
+            "sources/foo/.lake/build",
+        ],
+        stdout=StringIO(),
+    )
+
+    assert exit_code == int(AsyncOrchestratorCliExitCode.SUCCESS)
+    config = read_config_model(
+        root / "config.yaml", AsyncOrchestratorProjectConfig, kind="async orchestrator config"
+    )
+    assert config.seed_worktree_build is True
+    assert config.seed_worktree_build_paths == (
+        "TauCeti/.lake/build",
+        "sources/foo/.lake/build",
+    )
+
+    exit_code = await run_cli(
+        ["run", "--root", str(root)],
+        orchestrator_factory=RecordingOrchestrator,
+    )
+
+    assert exit_code == int(AsyncOrchestratorCliExitCode.SUCCESS)
+    assert len(seen_configs) == 1
+    assert seen_configs[0].seed_worktree_build_paths == (
+        "TauCeti/.lake/build",
+        "sources/foo/.lake/build",
+    )
+
+
+async def test_init_defaults_seed_worktree_build_paths_to_root_lake_build(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "orch"
+    entrypoint = tmp_path / "repo"
+    entrypoint.mkdir()
+
+    await run_cli(
+        ["init", "--root", str(root), "--entrypoint", str(entrypoint)],
+        stdout=StringIO(),
+    )
+
+    config = read_config_model(
+        root / "config.yaml", AsyncOrchestratorProjectConfig, kind="async orchestrator config"
+    )
+    assert config.seed_worktree_build_paths == (".lake/build",)
+
+
+@pytest.mark.parametrize(
+    ("paths", "message"),
+    [
+        (["/abs/.lake/build"], "relative to the worktree root"),
+        (["TauCeti/../.lake/build"], "'.' or '..'"),
+        (["TauCeti//.lake/build"], "normalized"),
+        (["TauCeti/.lake/build", "TauCeti/.lake/build"], "unique"),
+        (["TauCeti/.lake", "TauCeti/.lake/build"], "ancestor"),
+    ],
+)
+async def test_init_rejects_invalid_seed_worktree_build_paths(
+    tmp_path: Path,
+    paths: list[str],
+    message: str,
+) -> None:
+    root = tmp_path / "orch"
+    entrypoint = tmp_path / "repo"
+    entrypoint.mkdir()
+    stderr = StringIO()
+    flags = [item for path in paths for item in ("--seed-worktree-build-path", path)]
+
+    exit_code = await run_cli(
+        ["init", "--root", str(root), "--entrypoint", str(entrypoint), *flags],
+        stderr=stderr,
+    )
+
+    assert exit_code == int(AsyncOrchestratorCliExitCode.CONFIGURATION_OR_USAGE)
+    assert message in stderr.getvalue()
+    # Rejected before init touched the filesystem.
+    assert not root.exists()
+
+
 async def test_init_rejects_non_positive_max_merge_batch_size(tmp_path: Path) -> None:
     root = tmp_path / "orch"
     stderr = StringIO()

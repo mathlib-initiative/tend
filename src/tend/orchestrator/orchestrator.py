@@ -101,16 +101,25 @@ _VALIDATION_WORKTREE_DIRNAME = "staging"
 # checkout so git reset/clean, workspace mirroring, and tracked paths cannot
 # create or restore readiness before provisioning succeeds.
 _VALIDATION_WORKTREE_PROVISIONED_SUFFIX = ".provisioned"
-# ``<root>/.build-cache`` holds a consistent snapshot of the staging worktree's
-# ``.lake/build`` (Lean build artifacts), refreshed after each successful
-# validated merge and copied into new task worktrees when ``seed_worktree_build``
-# is enabled. Kept directly under ``<root>`` (a sibling of ``worktrees`` and
-# ``staging``) so closed-worktree pruning never touches it. The relative build
-# subtree mirrored from a worktree root.
+# ``<root>/.build-cache`` holds a consistent snapshot of each of the staging
+# worktree's ``seed_worktree_build_paths`` (Lean build artifacts, by default
+# ``.lake/build``), refreshed after each successful validated merge and copied
+# into new task worktrees when ``seed_worktree_build`` is enabled. Kept directly
+# under ``<root>`` (a sibling of ``worktrees`` and ``staging``) so closed-worktree
+# pruning never touches it. The default ``.lake/build`` keeps its historical
+# location ``<root>/.build-cache/build`` so already-initialized roots keep their
+# cache; any other path ``P`` is stored at ``<root>/.build-cache/paths/P/snapshot``.
+# The fixed ``snapshot`` leaf keeps each entry's atomic-swap siblings
+# (``snapshot.incoming``/``snapshot.old``) inside that entry's own directory, so
+# entries never collide given the config's no-overlap rule.
 _BUILD_CACHE_DIRNAME = ".build-cache"
+_BUILD_CACHE_DEFAULT_ENTRY_NAME = "build"
+_BUILD_CACHE_PATHS_DIRNAME = "paths"
+_BUILD_CACHE_SNAPSHOT_NAME = "snapshot"
 # Worker discussions are durable store records. Keep a representative path
 # sample instead of expanding an adversarial graph's full attribution set.
 _MAX_DISCUSSION_OFFENDING_PATHS = 30
+# The default seed build path, whose cache lives at the legacy location.
 _LAKE_BUILD_RELPATH = ".lake/build"
 _WORKTREE_NAME_PATTERN: Pattern[str] = compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _ORCHESTRATOR_GIT_METADATA_PATHSPEC = ".tend"
@@ -509,8 +518,9 @@ class AsyncOrchestrator:
         # (or reused on resume). Only used when ``merge_validation_worktree``.
         self._validation_worktree_ready = False
         # Serializes refresh (post-merge snapshot) and reads (seed-on-creation)
-        # of the ``<root>/.build-cache`` build snapshot, so a worktree never
-        # seeds from a half-written cache. Only used when ``seed_worktree_build``.
+        # of the ``<root>/.build-cache`` build snapshots (all configured
+        # ``seed_worktree_build_paths``), so a worktree never seeds from a
+        # half-written cache. Only used when ``seed_worktree_build``.
         self._build_cache_lock = asyncio.Lock()
 
     @property
@@ -3459,49 +3469,80 @@ class AsyncOrchestrator:
             )
 
     def _build_cache_dir(self) -> Path:
-        """Absolute path of the ``<root>/.build-cache`` Lean build snapshot."""
+        """Absolute path of the ``<root>/.build-cache`` Lean build snapshots."""
 
         return _absolute_path(self.config.root) / _BUILD_CACHE_DIRNAME
 
     async def _refresh_build_cache_from_staging(self, staging: Path) -> None:
-        """Snapshot the staging worktree's ``.lake/build`` into ``<root>/.build-cache``.
+        """Snapshot each staging ``seed_worktree_build_paths`` entry into the cache.
 
         Called after a successful validated merge, when the staging worktree's
-        build is consistent and matches the just-published ``main``. Best-effort:
-        a snapshot failure is logged and swallowed — it must never break the merge
-        path (a stale/absent cache only means the next worktree builds from
-        scratch). Serialized against seed reads by ``_build_cache_lock``.
+        build is consistent and matches the just-published ``main``. Each
+        configured path is snapshotted independently into its
+        :func:`_build_cache_entry` under ``<root>/.build-cache``. Best-effort per
+        path: a missing staging directory or a snapshot failure is logged and
+        swallowed, leaving that path's previous snapshot (if any) in place and
+        the other paths unaffected — it must never break the merge path (a
+        stale/absent cache only means the next worktree builds that path from
+        scratch). Serialized against seed reads by ``_build_cache_lock``, held
+        across all paths so a seed never mixes snapshots from different merges.
         """
 
-        source = staging / _LAKE_BUILD_RELPATH
-        if not source.is_dir():
-            return
         cache = self._build_cache_dir()
         async with self._build_cache_lock:
-            try:
-                await asyncio.to_thread(_replace_dir_copy, source, cache / "build")
-            except Exception as exc:  # noqa: BLE001 - best-effort cache refresh
-                _LOGGER.warning("failed to refresh worktree build cache from staging: %s", exc)
+            for relative_path in self.config.seed_worktree_build_paths:
+                source = _join_relative_posix(staging, relative_path)
+                try:
+                    if not source.is_dir():
+                        _LOGGER.warning(
+                            "seed_worktree_build path %s is not a directory in staging; "
+                            "leaving its build cache unchanged",
+                            relative_path,
+                        )
+                        continue
+                    await asyncio.to_thread(
+                        _replace_dir_copy, source, _build_cache_entry(cache, relative_path)
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort cache refresh
+                    _LOGGER.warning(
+                        "failed to refresh worktree build cache for %s from staging: %s",
+                        relative_path,
+                        exc,
+                    )
 
     async def _seed_worktree_build_from_cache(self, worktree_path: Path, *, label: str) -> None:
-        """Copy the ``<root>/.build-cache`` snapshot into a new worktree's ``.lake/build``.
+        """Copy each cached ``seed_worktree_build_paths`` snapshot into a new worktree.
 
         Makes the worker's first ``lake build`` incremental (recompile only its
-        edits + dependents) instead of from scratch. Best-effort: if the cache is
-        absent (no successful merge yet) or the copy fails, the worktree simply
-        builds from scratch. Serialized against the refresh by ``_build_cache_lock``.
+        edits + dependents) instead of from scratch. Best-effort per path: if a
+        path's cache entry is absent (no successful merge yet), its destination
+        is unsafe (see :func:`_ensure_safe_seed_build_destination`), or the copy
+        fails, that path simply builds from scratch while the others are still
+        seeded. Serialized against the refresh by ``_build_cache_lock``.
         """
 
-        cached_build = self._build_cache_dir() / "build"
-        if not cached_build.is_dir():
-            return
-        destination = worktree_path / _LAKE_BUILD_RELPATH
+        cache = self._build_cache_dir()
         async with self._build_cache_lock:
-            try:
-                await asyncio.to_thread(_seed_build_dir_copy, cached_build, destination)
-                _LOGGER.info("seeded worktree build cache into async worktree: %s", label)
-            except Exception as exc:  # noqa: BLE001 - best-effort build seeding
-                _LOGGER.warning("failed to seed build cache into worktree %s: %s", label, exc)
+            for relative_path in self.config.seed_worktree_build_paths:
+                cached_build = _build_cache_entry(cache, relative_path)
+                try:
+                    if not cached_build.is_dir():
+                        continue
+                    await asyncio.to_thread(
+                        _seed_build_dir_copy, cached_build, worktree_path, relative_path
+                    )
+                    _LOGGER.info(
+                        "seeded worktree build cache %s into async worktree: %s",
+                        relative_path,
+                        label,
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort build seeding
+                    _LOGGER.warning(
+                        "failed to seed build cache %s into worktree %s: %s",
+                        relative_path,
+                        label,
+                        exc,
+                    )
 
     async def _create_fresh_worktree_locked(
         self,
@@ -3900,37 +3941,68 @@ def _cp_archive_into(source_dir: Path, destination_dir: Path) -> None:
     )
 
 
-def _seed_build_dir_copy(source_dir: Path, destination_dir: Path) -> None:
-    """Replace a worktree's local ``.lake/build`` with ``source_dir``'s contents.
+def _join_relative_posix(root: Path, relative_path: str) -> Path:
+    """Join a validated relative POSIX path (``a/b/c``) onto ``root``."""
 
-    Seeding must own a safe local build directory: overlaying into an existing
-    build leaves stale artifacts, while writing through a symlinked ``.lake`` (or
-    symlinked ``.lake/build``) can mutate the entrypoint/shared cache. Reject
-    those unsafe shapes; callers treat this as best-effort and leave the worktree
-    unseeded.
+    return root.joinpath(*PurePosixPath(relative_path).parts)
+
+
+def _build_cache_entry(cache_dir: Path, relative_path: str) -> Path:
+    """Cache directory holding the snapshot of worktree build path ``relative_path``.
+
+    The default ``.lake/build`` keeps the historical ``<cache>/build`` location
+    so existing roots keep seeding from their cache; any other path ``P`` lives
+    at ``<cache>/paths/P/snapshot``. Config validation forbids overlapping
+    paths, so distinct entries own disjoint cache subtrees (including the
+    ``.incoming``/``.old`` swap siblings :func:`_replace_dir_copy` creates).
     """
 
-    _ensure_safe_seed_build_destination(destination_dir)
+    if relative_path == _LAKE_BUILD_RELPATH:
+        return cache_dir / _BUILD_CACHE_DEFAULT_ENTRY_NAME
+    return (
+        _join_relative_posix(cache_dir / _BUILD_CACHE_PATHS_DIRNAME, relative_path)
+        / _BUILD_CACHE_SNAPSHOT_NAME
+    )
+
+
+def _seed_build_dir_copy(source_dir: Path, worktree_root: Path, relative_path: str) -> None:
+    """Replace ``worktree_root/relative_path`` with ``source_dir``'s contents.
+
+    Seeding must own a safe local build directory: overlaying into an existing
+    build leaves stale artifacts, while writing through a symlink anywhere on
+    the way to the destination (e.g. a mirrored ``TauCeti/.lake`` or
+    ``.lake/build`` symlink into the entrypoint) can mutate the entrypoint or a
+    shared cache. Reject those unsafe shapes; callers treat this as best-effort
+    and leave that path unseeded.
+    """
+
+    destination_dir = _ensure_safe_seed_build_destination(worktree_root, relative_path)
     _replace_dir_copy(source_dir, destination_dir)
 
 
-def _ensure_safe_seed_build_destination(destination_dir: Path) -> None:
-    lake_dir = destination_dir.parent
-    if lake_dir.is_symlink():
-        raise RuntimeError(f"refusing to seed build cache through symlinked .lake: {lake_dir}")
-    if lake_dir.exists() and not lake_dir.is_dir():
-        raise RuntimeError(
-            f"refusing to seed build cache because .lake is not a directory: {lake_dir}"
-        )
-    if destination_dir.is_symlink():
-        raise RuntimeError(
-            f"refusing to seed build cache over symlinked .lake/build: {destination_dir}"
-        )
-    if destination_dir.exists() and not destination_dir.is_dir():
-        raise RuntimeError(
-            "refusing to seed build cache because .lake/build is not a directory: "
-            f"{destination_dir}"
-        )
+def _ensure_safe_seed_build_destination(worktree_root: Path, relative_path: str) -> Path:
+    """Return the seed destination, refusing symlinked or non-directory components.
+
+    Every *existing* component between ``worktree_root`` (exclusive) and the
+    destination (inclusive) must be a real directory, never a symlink: the
+    workspace mirror symlinks shared read-only trees into worktrees, and the
+    seed must never write through one of them. Missing components are fine
+    (they are created as real directories by the copy).
+    """
+
+    current = worktree_root
+    for part in PurePosixPath(relative_path).parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(f"refusing to seed build cache through symlinked path: {current}")
+        if not current.exists():
+            break
+        if not current.is_dir():
+            raise RuntimeError(
+                "refusing to seed build cache because a path component is not a directory: "
+                f"{current}"
+            )
+    return _join_relative_posix(worktree_root, relative_path)
 
 
 def _replace_dir_copy(source_dir: Path, destination_dir: Path) -> None:
