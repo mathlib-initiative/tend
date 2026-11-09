@@ -38,6 +38,7 @@ from tend.orchestrator.code_snapshot import (
     validate_code_snapshot_location,
 )
 from tend.orchestrator.config import (
+    DEFAULT_SEED_WORKTREE_BUILD_PATHS,
     AsyncOrchestratorAgentCommandConfig,
     AsyncOrchestratorBudgetConfig,
     AsyncOrchestratorConfig,
@@ -45,6 +46,7 @@ from tend.orchestrator.config import (
     AsyncOrchestratorValidationCommandConfig,
     AsyncOrchestratorWorkspaceMirrorConfig,
     AsyncOrchestratorWorktreeSetupCommandConfig,
+    validate_seed_worktree_build_paths,
 )
 from tend.orchestrator.control_store import (
     ASYNC_ORCHESTRATOR_DB_FILENAME,
@@ -410,6 +412,7 @@ def _handle_init(namespace: argparse.Namespace, *, stdout: TextIO) -> None:
     config_path = _config_path(root)
     force = _bool_arg(namespace, "force")
     worktree_setup_command = _init_worktree_setup_command(namespace)
+    seed_worktree_build_paths = _init_seed_worktree_build_paths(namespace)
     _ensure_root_outside_entrypoint(root, entrypoint)
     _LOGGER.info("initializing async orchestration root: %s", root)
     if root.exists():
@@ -481,6 +484,7 @@ def _handle_init(namespace: argparse.Namespace, *, stdout: TextIO) -> None:
         pre_merge_validation_commands=_init_pre_merge_validation_commands(namespace),
         merge_validation_worktree=not _bool_arg(namespace, "no_merge_validation_worktree"),
         seed_worktree_build=_bool_arg(namespace, "seed_worktree_build"),
+        seed_worktree_build_paths=seed_worktree_build_paths,
         batched_merge=not _bool_arg(namespace, "no_batched_merge"),
         max_merge_batch_size=cast("int | None", namespace.max_merge_batch_size),
         skip_build_validation_for_task_only_merges=_bool_arg(
@@ -788,6 +792,7 @@ def _config_from_namespace(namespace: argparse.Namespace) -> AsyncOrchestratorCo
         merge_target_branch=resolved_config.merge_target_branch,
         merge_validation_worktree=resolved_config.merge_validation_worktree,
         seed_worktree_build=resolved_config.seed_worktree_build,
+        seed_worktree_build_paths=resolved_config.seed_worktree_build_paths,
         batched_merge=resolved_config.batched_merge,
         max_merge_batch_size=resolved_config.max_merge_batch_size,
         skip_build_validation_for_task_only_merges=(
@@ -1227,6 +1232,24 @@ def _init_workspace_mirror(
         exclude_names=list(exclude_names),
         exclude_paths=list(exclude_paths),
     )
+
+
+def _init_seed_worktree_build_paths(namespace: argparse.Namespace) -> tuple[str, ...]:
+    """Build ``seed_worktree_build_paths`` written to config.yaml by ``tend init``.
+
+    Without ``--seed-worktree-build-path`` this is the config default
+    (``.lake/build``); when the flag is given, its repeated values replace that
+    default. Cross-entry rules (unique, non-overlapping) are checked here, before
+    ``init`` touches the filesystem.
+    """
+
+    paths = cast("Sequence[str] | None", getattr(namespace, "seed_worktree_build_paths", None))
+    if not paths:
+        return DEFAULT_SEED_WORKTREE_BUILD_PATHS
+    try:
+        return validate_seed_worktree_build_paths(paths)
+    except ValueError as exc:
+        raise AsyncOrchestratorCliError("cli_usage_error", str(exc)) from exc
 
 
 def _init_pre_merge_validation_commands(
@@ -1895,11 +1918,27 @@ def _build_init_parser(prog: str) -> argparse.ArgumentParser:
         action="store_true",
         dest="seed_worktree_build",
         help=(
-            "Seed each new task worktree's .lake/build from a snapshot of the "
+            "Seed each new task worktree's build directories (default: "
+            ".lake/build; see --seed-worktree-build-path) from a snapshot of the "
             "staging worktree's build cache (refreshed after every validated "
             "merge), so the worker's first `lake build` is incremental against "
             "current main instead of from scratch. Requires the staging "
             "validation worktree (on by default)."
+        ),
+    )
+    parser.add_argument(
+        "--seed-worktree-build-path",
+        "--seed_worktree_build_path",
+        dest="seed_worktree_build_paths",
+        action="append",
+        type=_seed_worktree_build_path_arg,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Worktree-relative build directory snapshotted and seeded by "
+            "--seed-worktree-build (e.g. TauCeti/.lake/build for a Lake project "
+            "in a subdirectory); may be repeated. When given, replaces the "
+            "default .lake/build."
         ),
     )
     parser.add_argument(
@@ -2287,6 +2326,13 @@ def _mirror_relative_path_arg(value: str) -> str:
     if "." in path.parts or ".." in path.parts:
         raise argparse.ArgumentTypeError("mirror path must not contain '.' or '..'")
     return path.as_posix()
+
+
+def _seed_worktree_build_path_arg(value: str) -> str:
+    try:
+        return validate_seed_worktree_build_paths((value,))[0]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _mirror_segment_arg(value: str) -> str:

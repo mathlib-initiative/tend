@@ -1564,10 +1564,64 @@ def test_seed_build_dir_copy_replaces_stale_destination(tmp_path: Path) -> None:
     (destination / "lib").mkdir(parents=True)
     (destination / "lib" / "Stale.olean").write_text("stale")
 
-    _orchestrator_module._seed_build_dir_copy(src, destination)  # pyright: ignore[reportPrivateUsage]
+    _orchestrator_module._seed_build_dir_copy(  # pyright: ignore[reportPrivateUsage]
+        src, tmp_path / "worktree", ".lake/build"
+    )
 
     assert (destination / "lib" / "Fresh.olean").read_text() == "fresh"
     assert not (destination / "lib" / "Stale.olean").exists()
+
+
+@pytest.mark.parametrize(
+    "symlink_path",
+    ["TauCeti", "TauCeti/.lake", "TauCeti/.lake/build"],
+)
+def test_seed_build_dir_copy_refuses_symlinked_ancestor(
+    tmp_path: Path,
+    symlink_path: str,
+) -> None:
+    """Seeding refuses if any component below the worktree root is a symlink.
+
+    The workspace mirror symlinks shared read-only trees into worktrees; seeding
+    a nested build path must never write through one into the shared target.
+    """
+
+    src = tmp_path / "src"
+    (src / "lib").mkdir(parents=True)
+    (src / "lib" / "Fresh.olean").write_text("fresh")
+    shared = tmp_path / "shared"
+    (shared / "lib").mkdir(parents=True)
+    (shared / "lib" / "Shared.olean").write_text("shared")
+    worktree = tmp_path / "worktree"
+    link = worktree / symlink_path
+    link.parent.mkdir(parents=True)
+    link.symlink_to(shared, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlinked path"):
+        _orchestrator_module._seed_build_dir_copy(  # pyright: ignore[reportPrivateUsage]
+            src, worktree, "TauCeti/.lake/build"
+        )
+
+    assert link.is_symlink()
+    assert sorted(path.name for path in shared.rglob("*")) == ["Shared.olean", "lib"]
+
+
+def test_seed_build_dir_copy_refuses_non_directory_ancestor(tmp_path: Path) -> None:
+    """A regular file where a destination component should be blocks seeding."""
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Fresh.olean").write_text("fresh")
+    worktree = tmp_path / "worktree"
+    (worktree / "TauCeti").mkdir(parents=True)
+    (worktree / "TauCeti" / ".lake").write_text("not a dir")
+
+    with pytest.raises(RuntimeError, match="not a directory"):
+        _orchestrator_module._seed_build_dir_copy(  # pyright: ignore[reportPrivateUsage]
+            src, worktree, "TauCeti/.lake/build"
+        )
+
+    assert (worktree / "TauCeti" / ".lake").read_text() == "not a dir"
 
 
 @pytest.mark.parametrize("symlink_path", [".lake", ".lake/build"])
@@ -1646,6 +1700,176 @@ def test_seed_worktree_build_requires_staging_and_mirror(tmp_path: Path) -> None
         workspace_mirror=enabled_mirror,
     )
     assert config.seed_worktree_build is True
+
+
+# Two Lake projects living as subtrees of the entrypoint (not at its root).
+_SUBDIR_SEED_PATHS = ("TauCeti/.lake/build", "sources/foo/.lake/build")
+
+
+def _commit_lake_subprojects(entrypoint: Path) -> None:
+    for project in ("TauCeti", "sources/foo"):
+        (entrypoint / project).mkdir(parents=True)
+        (entrypoint / project / "lakefile.toml").write_text(f'name = "{project}"\n')
+    _run_git(entrypoint, "add", "TauCeti", "sources")
+    _run_git(entrypoint, "commit", "-m", "add lake subprojects")
+
+
+def test_build_cache_entry_keeps_legacy_location_for_default_path(tmp_path: Path) -> None:
+    """The default path keeps ``<root>/.build-cache/build``; others nest under ``paths``."""
+
+    cache = tmp_path / ".build-cache"
+    entry = _orchestrator_module._build_cache_entry  # pyright: ignore[reportPrivateUsage]
+
+    assert entry(cache, ".lake/build") == cache / "build"
+    assert entry(cache, "TauCeti/.lake/build") == (
+        cache / "paths" / "TauCeti" / ".lake" / "build" / "snapshot"
+    )
+    assert entry(cache, "sources/foo/.lake/build") == (
+        cache / "paths" / "sources" / "foo" / ".lake" / "build" / "snapshot"
+    )
+
+
+async def test_seed_worktree_build_paths_snapshot_and_seed_subdirectory_projects(
+    tmp_path: Path,
+) -> None:
+    """Each configured subdirectory build path is snapshotted from staging into
+    its own cache entry and seeded into a new worktree; a configured path the
+    build never produces is skipped without affecting the others."""
+
+    _require_git_and_sh()
+
+    entrypoint = tmp_path / "entrypoint"
+    root = tmp_path / "orch"
+    _initialize_git_repo(entrypoint)
+    seed = _seed_tasks_dir(entrypoint)
+    _commit_lake_subprojects(entrypoint)
+    orchestrator = WorktreeTestingOrchestrator(
+        AsyncOrchestratorConfig(
+            root=root,
+            entrypoint=entrypoint,
+            merge_validation_worktree=True,
+            seed_worktree_build=True,
+            seed_worktree_build_paths=(*_SUBDIR_SEED_PATHS, "missing/.lake/build"),
+            workspace_mirror=AsyncOrchestratorWorkspaceMirrorConfig(enabled=True),
+            # Simulate per-project Lean builds writing oleans in staging.
+            pre_merge_validation_commands=(
+                _validation_command(
+                    "mkdir -p TauCeti/.lake/build/lib sources/foo/.lake/build/lib"
+                    " && printf tau > TauCeti/.lake/build/lib/Tau.olean"
+                    " && printf foo > sources/foo/.lake/build/lib/Foo.olean"
+                ),
+            ),
+        ),
+        task_manager=_task_manager_with_tasks(seed),
+    )
+    worktree = await orchestrator.create_fresh_worktree_for_test(name="adds-task", task=seed)
+    write_task(task_directory(worktree.path) / "002-follow-up.yaml", _follow_up(seed))
+    _commit_worktree(worktree.path)
+    await orchestrator.transition_worktree_for_test(worktree.worktree_id, WorktreeState.MERGE)
+
+    await orchestrator.process_merge_queue_once_for_test()
+
+    assert orchestrator.worktrees_by_id[worktree.worktree_id].state is WorktreeState.CLOSED
+    cache = root / ".build-cache"
+    tau_entry = cache / "paths" / "TauCeti" / ".lake" / "build" / "snapshot"
+    foo_entry = cache / "paths" / "sources" / "foo" / ".lake" / "build" / "snapshot"
+    assert (tau_entry / "lib" / "Tau.olean").read_text() == "tau"
+    assert (foo_entry / "lib" / "Foo.olean").read_text() == "foo"
+    assert not (tau_entry.parent / "snapshot.incoming").exists()
+    assert not (cache / "paths" / "missing").exists()
+    # ``.lake/build`` is not configured here, so the legacy entry is never written.
+    assert not (cache / "build").exists()
+
+    fresh = await orchestrator.create_fresh_worktree_for_test(name="seeded", task=seed)
+    tau_seeded = fresh.path / "TauCeti" / ".lake" / "build" / "lib" / "Tau.olean"
+    foo_seeded = fresh.path / "sources" / "foo" / ".lake" / "build" / "lib" / "Foo.olean"
+    assert tau_seeded.read_text() == "tau"
+    assert foo_seeded.read_text() == "foo"
+    assert not (fresh.path / "missing").exists()
+    assert not (fresh.path / ".lake").exists()
+
+
+async def test_seed_worktree_build_default_path_seeds_from_legacy_cache_location(
+    tmp_path: Path,
+) -> None:
+    """An already-initialized root's ``<root>/.build-cache/build`` keeps seeding
+    ``.lake/build`` under the default ``seed_worktree_build_paths``."""
+
+    _require_git_and_sh()
+
+    entrypoint = tmp_path / "entrypoint"
+    root = tmp_path / "orch"
+    _initialize_git_repo(entrypoint)
+    seed = _seed_tasks_dir(entrypoint)
+    (root / ".build-cache" / "build" / "lib").mkdir(parents=True)
+    (root / ".build-cache" / "build" / "lib" / "Legacy.olean").write_text("legacy")
+    orchestrator = WorktreeTestingOrchestrator(
+        AsyncOrchestratorConfig(
+            root=root,
+            entrypoint=entrypoint,
+            merge_validation_worktree=True,
+            seed_worktree_build=True,
+            workspace_mirror=AsyncOrchestratorWorkspaceMirrorConfig(enabled=True),
+        ),
+        task_manager=_task_manager_with_tasks(seed),
+    )
+
+    fresh = await orchestrator.create_fresh_worktree_for_test(name="seeded", task=seed)
+
+    assert orchestrator.config.seed_worktree_build_paths == (".lake/build",)
+    seeded = fresh.path / ".lake" / "build" / "lib" / "Legacy.olean"
+    assert seeded.read_text() == "legacy"
+    assert not (root / ".build-cache" / "paths").exists()
+
+
+@pytest.mark.parametrize("symlink_path", ["TauCeti/.lake", "TauCeti/.lake/build"])
+async def test_seed_worktree_build_paths_skip_symlinked_ancestor_and_seed_others(
+    tmp_path: Path,
+    symlink_path: str,
+) -> None:
+    """Seeding never writes through a mirrored symlink on the way to a nested
+    build path (leaving the shared entrypoint copy untouched), and the refusal
+    for one path does not stop the other paths from being seeded."""
+
+    _require_git_and_sh()
+
+    entrypoint = tmp_path / "entrypoint"
+    root = tmp_path / "orch"
+    _initialize_git_repo(entrypoint)
+    seed = _seed_tasks_dir(entrypoint)
+    _commit_lake_subprojects(entrypoint)
+    # The shared tree the mirror symlinks into worktrees.
+    (entrypoint / "TauCeti" / ".lake" / "packages").mkdir(parents=True)
+    (entrypoint / "TauCeti" / ".lake" / "build").mkdir(parents=True)
+    cache_paths = root / ".build-cache" / "paths"
+    for project, olean in (("TauCeti", "Tau.olean"), ("sources/foo", "Foo.olean")):
+        lib = cache_paths.joinpath(*project.split("/"), ".lake", "build", "snapshot", "lib")
+        lib.mkdir(parents=True)
+        (lib / olean).write_text("fresh")
+    orchestrator = WorktreeTestingOrchestrator(
+        AsyncOrchestratorConfig(
+            root=root,
+            entrypoint=entrypoint,
+            merge_validation_worktree=True,
+            seed_worktree_build=True,
+            seed_worktree_build_paths=_SUBDIR_SEED_PATHS,
+            workspace_mirror=AsyncOrchestratorWorkspaceMirrorConfig(
+                enabled=True,
+                symlink_paths=[symlink_path],
+            ),
+        ),
+        task_manager=_task_manager_with_tasks(seed),
+    )
+
+    fresh = await orchestrator.create_fresh_worktree_for_test(
+        name=f"seeded-{symlink_path.replace('/', '-')}",
+        task=seed,
+    )
+
+    assert (fresh.path / symlink_path).is_symlink()
+    assert list((entrypoint / "TauCeti" / ".lake" / "build").iterdir()) == []
+    foo_seeded = fresh.path / "sources" / "foo" / ".lake" / "build" / "lib" / "Foo.olean"
+    assert foo_seeded.read_text() == "fresh"
 
 
 def _named_task(seed: Task, name: str) -> Task:

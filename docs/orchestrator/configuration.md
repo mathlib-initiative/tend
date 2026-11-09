@@ -57,6 +57,7 @@ Fields:
 | `workspace_mirror` | object | disabled | Mirror/symlink selected entrypoint paths into new worktrees. |
 | `merge_validation_worktree` | bool | `true` | Validate approved merges in `<root>/staging` before fast-forwarding the entrypoint. |
 | `seed_worktree_build` | bool | `false` | Seed new worktrees from the staging worktree build cache. |
+| `seed_worktree_build_paths` | list of relative paths | `[.lake/build]` | Worktree-relative build directories that `seed_worktree_build` snapshots from staging and seeds into new worktrees, e.g. `TauCeti/.lake/build` for a Lake project in a subdirectory. See [Build seeding](#build-seeding). |
 | `batched_merge` | bool | `true` | Validate/publish queued approved worktrees in batches when staging is enabled. |
 | `max_merge_batch_size` | positive int or null | `null` | Optional cap on MERGE worktrees included in one staging batch; `null`/omitted drains all visible queued merges. |
 | `skip_build_validation_for_task_only_merges` | bool | `false` | Skip `pre_merge_validation_commands` for merges whose diff changed only files under `tasks/`; the build-free task-tree gate still runs first. |
@@ -163,6 +164,21 @@ In staging-worktree mode, a crash-signal exit such as SIGSEGV triggers a cold re
 `<root>/staging` is orchestrator-private. `tend run` holds an exclusive advisory lock on the root for the complete run. Before resetting, cleaning, or reusing an existing staging path, the orchestrator requires it to be a real (non-symlink) directory registered as this entrypoint's staging worktree; any unexpected object is rename-quarantined as `staging.invalid-*` without following it, then a fresh staging worktree is provisioned. External tools must not register another worktree at that path while an orchestrator owns the root.
 
 If the git merge itself fails, pre-merge validation commands are not run; the existing merge-failure feedback and rollback path handles that case.
+
+## Build seeding
+
+`seed_worktree_build` requires `merge_validation_worktree: true` and `workspace_mirror.enabled: true`. When it is on, every successful validated merge in `<root>/staging` snapshots each entry of `seed_worktree_build_paths` from staging into `<root>/.build-cache`, and each newly created task worktree is seeded from those snapshots so its first build is incremental against the merge target. List one entry per Lake project when the entrypoint holds several projects as subdirectories:
+
+```yaml
+seed_worktree_build: true
+seed_worktree_build_paths:
+  - TauCeti/.lake/build
+  - sources/foo/.lake/build
+```
+
+Entries are POSIX paths relative to the worktree root. Each must be non-empty, relative, and normalized (no `.` or `..` components, no duplicate or trailing `/`, no backslashes); entries must be unique and no entry may be an ancestor of another. The default `.lake/build` is cached at `<root>/.build-cache/build`; any other path `P` is cached at `<root>/.build-cache/paths/P/snapshot`.
+
+Each path is handled independently and best-effort. A path that is not a directory in staging after a merge is logged and keeps its previous snapshot, and a failed copy for one path does not affect the other paths or the merge. A path with no snapshot yet is simply not seeded. Seeding replaces the worktree's directory atomically, and refuses (logging a warning and leaving that path unseeded) if any existing component between the worktree root and the destination is a symlink or a non-directory, so it never writes through a `workspace_mirror.symlink_paths` link into the entrypoint's shared copy.
 
 ## Runtime overrides from CLI
 

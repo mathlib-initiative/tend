@@ -61,6 +61,7 @@ Flags:
 | `--no-build-gate` | Explicitly omit the post-merge build gate. |
 | `--no-merge-validation-worktree` | Disable staging validation worktree; validate directly in the entrypoint. |
 | `--seed-worktree-build` | Seed new worktrees from the staging worktree build cache. |
+| `--seed-worktree-build-path PATH` / `--seed_worktree_build_path PATH` | Worktree-relative build directory written to `seed_worktree_build_paths` (e.g. `TauCeti/.lake/build`). May be repeated; when given, replaces the default `.lake/build`. |
 | `--no-batched-merge` | Disable batched staging merges. |
 | `--max-merge-batch-size N` | Cap each batched staging validation to N MERGE worktrees; omit for drain-all behavior. |
 | `--skip-build-validation-for-task-only-merges` | Skip the post-merge build gate for merges whose diff changed only files under `tasks/`; the task-tree gate still runs first. |

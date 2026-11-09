@@ -32,6 +32,12 @@ _DEFAULT_AGENT_OOM_SCORE_ADJ = 750
 _PositiveDecimal = Annotated[Decimal, Field(gt=Decimal(0))]
 _WORKTREE_SETUP_PLACEHOLDERS = frozenset({"entrypoint", "worktree"})
 _DEFAULT_MERGE_TARGET_BRANCH = "main"
+# Build output directories (relative to a worktree root) snapshotted from
+# staging and seeded into new task worktrees when ``seed_worktree_build`` is on.
+# The default covers a Lake project at the repository root; entrypoints holding
+# several Lake projects as subtrees list each one (e.g. ``TauCeti/.lake/build``).
+DEFAULT_SEED_WORKTREE_BUILD_PATHS: tuple[str, ...] = (".lake/build",)
+_SEED_WORKTREE_BUILD_PATHS_FIELD = "seed_worktree_build_paths"
 _FORMATTER = Formatter()
 
 
@@ -177,8 +183,9 @@ def _check_seed_worktree_build(
     """Reject ``seed_worktree_build`` without its prerequisites.
 
     The build-cache snapshot is taken from the staging validation worktree, so
-    that worktree must exist (``merge_validation_worktree``). The seeded
-    ``.lake/build`` oleans reference the read-only packages (e.g. Mathlib) that
+    that worktree must exist (``merge_validation_worktree``). The seeded build
+    directories (``seed_worktree_build_paths``, by default ``.lake/build``)
+    hold oleans that reference the read-only packages (e.g. Mathlib) that
     the workspace mirror provides via ``symlink_paths``; without the mirror the
     worktree would have no packages and rebuild them from scratch, defeating the
     optimization. Both are therefore required.
@@ -194,7 +201,7 @@ def _check_seed_worktree_build(
     if not mirror_enabled:
         raise ValueError(
             "seed_worktree_build requires workspace_mirror.enabled: seeded "
-            ".lake/build artifacts reference the read-only packages the mirror "
+            "build artifacts reference the read-only packages the mirror "
             "provides (e.g. Mathlib); without them the worktree would rebuild "
             "them from scratch."
         )
@@ -265,12 +272,16 @@ class AsyncOrchestratorProjectConfig(StrictModel):
     # worktree creation is not starved while a build runs. See
     # ``AsyncOrchestratorConfig.merge_validation_worktree``.
     merge_validation_worktree: bool = True
-    # When true (and ``merge_validation_worktree`` is on), snapshot the staging
-    # worktree's ``.lake/build`` after each successful validated merge and seed
-    # it into every newly-created task worktree, so the worker's first build is
-    # incremental against current ``main`` rather than from scratch. See
-    # ``AsyncOrchestratorConfig.seed_worktree_build``.
+    # When true (and ``merge_validation_worktree`` is on), snapshot each of the
+    # staging worktree's ``seed_worktree_build_paths`` after each successful
+    # validated merge and seed them into every newly-created task worktree, so
+    # the worker's first build is incremental against current ``main`` rather
+    # than from scratch. See ``AsyncOrchestratorConfig.seed_worktree_build``.
     seed_worktree_build: bool = False
+    # Worktree-relative POSIX build directories snapshotted/seeded by
+    # ``seed_worktree_build``. See
+    # ``AsyncOrchestratorConfig.seed_worktree_build_paths``.
+    seed_worktree_build_paths: tuple[str, ...] = DEFAULT_SEED_WORKTREE_BUILD_PATHS
     # Batch ready worktrees into one staging build per round instead of
     # validating each merge serially. Only effective with
     # ``merge_validation_worktree`` (the legacy in-entrypoint path is unaffected).
@@ -316,6 +327,16 @@ class AsyncOrchestratorProjectConfig(StrictModel):
     @classmethod
     def _coerce_validation_commands(cls, value: object) -> object:
         return _coerce_validation_command_configs(value)
+
+    @field_validator("seed_worktree_build_paths", mode="before")
+    @classmethod
+    def _coerce_seed_worktree_build_paths(cls, value: object) -> object:
+        return _coerce_string_tuple(value)
+
+    @field_validator("seed_worktree_build_paths")
+    @classmethod
+    def _validate_seed_worktree_build_paths(cls, paths: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_seed_worktree_build_paths(paths)
 
     @field_validator("merge_target_branch")
     @classmethod
@@ -365,6 +386,7 @@ class AsyncOrchestratorProjectConfig(StrictModel):
             merge_target_branch=self.merge_target_branch,
             merge_validation_worktree=self.merge_validation_worktree,
             seed_worktree_build=self.seed_worktree_build,
+            seed_worktree_build_paths=self.seed_worktree_build_paths,
             batched_merge=self.batched_merge,
             max_merge_batch_size=self.max_merge_batch_size,
             skip_build_validation_for_task_only_merges=(
@@ -399,13 +421,21 @@ class AsyncOrchestratorConfig(StrictModel):
     # never reset/reverted, so worktree creation only contends with the brief
     # fast-forward publish (``entrypoint_lock``) rather than the whole build.
     merge_validation_worktree: bool = True
-    # Seed each new task worktree's ``.lake/build`` from a snapshot of the
-    # staging worktree's build cache (taken after each successful validated
-    # merge, so it tracks ``main``). Makes a worker's first ``lake build``
-    # incremental instead of from scratch — far less wall-time, and shorter
-    # peak-memory windows so fewer builds overlap at peak. Requires
-    # ``merge_validation_worktree`` (the staging worktree is the cache source).
+    # Seed each new task worktree's build directories
+    # (``seed_worktree_build_paths``) from a snapshot of the staging worktree's
+    # build cache (taken after each successful validated merge, so it tracks
+    # ``main``). Makes a worker's first ``lake build`` incremental instead of
+    # from scratch — far less wall-time, and shorter peak-memory windows so
+    # fewer builds overlap at peak. Requires ``merge_validation_worktree`` (the
+    # staging worktree is the cache source).
     seed_worktree_build: bool = False
+    # Worktree-relative POSIX build directories that ``seed_worktree_build``
+    # snapshots from staging and seeds into new worktrees, each independently
+    # and best-effort. The default ``.lake/build`` covers a Lake project at the
+    # repository root; list e.g. ``TauCeti/.lake/build`` for Lake projects in
+    # subdirectories. Entries must be normalized, relative, free of ``.``/``..``
+    # components and backslashes, unique, and none may contain another.
+    seed_worktree_build_paths: tuple[str, ...] = DEFAULT_SEED_WORKTREE_BUILD_PATHS
     # Batch currently-ready worktrees into a single staging validation build per
     # round instead of validating one merge at a time: one build for K merges. A
     # one-item queue batches as size 1 (= today), so this only engages under a
@@ -455,6 +485,7 @@ class AsyncOrchestratorConfig(StrictModel):
         merge_target_branch: str = _DEFAULT_MERGE_TARGET_BRANCH,
         merge_validation_worktree: bool = True,
         seed_worktree_build: bool = False,
+        seed_worktree_build_paths: Sequence[str] = DEFAULT_SEED_WORKTREE_BUILD_PATHS,
         batched_merge: bool = True,
         max_merge_batch_size: int | None = None,
         skip_build_validation_for_task_only_merges: bool = False,
@@ -483,6 +514,7 @@ class AsyncOrchestratorConfig(StrictModel):
                 "merge_target_branch": merge_target_branch,
                 "merge_validation_worktree": merge_validation_worktree,
                 "seed_worktree_build": seed_worktree_build,
+                "seed_worktree_build_paths": seed_worktree_build_paths,
                 "batched_merge": batched_merge,
                 "max_merge_batch_size": max_merge_batch_size,
                 "skip_build_validation_for_task_only_merges": (
@@ -511,6 +543,16 @@ class AsyncOrchestratorConfig(StrictModel):
     def _coerce_validation_commands(cls, value: object) -> object:
         return _coerce_validation_command_configs(value)
 
+    @field_validator("seed_worktree_build_paths", mode="before")
+    @classmethod
+    def _coerce_seed_worktree_build_paths(cls, value: object) -> object:
+        return _coerce_string_tuple(value)
+
+    @field_validator("seed_worktree_build_paths")
+    @classmethod
+    def _validate_seed_worktree_build_paths(cls, paths: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_seed_worktree_build_paths(paths)
+
     @field_validator("merge_target_branch")
     @classmethod
     def _validate_merge_target_branch(cls, value: str) -> str:
@@ -538,6 +580,61 @@ class AsyncOrchestratorConfig(StrictModel):
             mirror_enabled=self.workspace_mirror.enabled,
         )
         return self
+
+
+def validate_seed_worktree_build_paths(paths: Sequence[str]) -> tuple[str, ...]:
+    """Validate ``seed_worktree_build_paths`` entries and return them as a tuple.
+
+    Each entry names a build directory relative to a worktree root, written as
+    a normalized POSIX path: non-empty, not absolute, no ``.``/``..`` or empty
+    components (so no duplicate or trailing ``/``), and no backslashes. Entries
+    must be unique and no entry may be an ancestor of another, so every entry
+    owns a disjoint subtree in both the worktree and the build cache.
+    """
+
+    field_name = _SEED_WORKTREE_BUILD_PATHS_FIELD
+    if not paths:
+        raise ValueError(f"{field_name} must contain at least one path")
+    for path in paths:
+        _validate_seed_worktree_build_path(path)
+    if len(set(paths)) != len(paths):
+        raise ValueError(f"{field_name} entries must be unique")
+    for ancestor in paths:
+        prefix = f"{ancestor}/"
+        for descendant in paths:
+            if descendant.startswith(prefix):
+                raise ValueError(
+                    f"{field_name} entries must not contain one another: "
+                    f"{ancestor!r} is an ancestor of {descendant!r}"
+                )
+    return tuple(paths)
+
+
+def _validate_seed_worktree_build_path(path: str) -> None:
+    field_name = _SEED_WORKTREE_BUILD_PATHS_FIELD
+    if not path.strip() or "\x00" in path:
+        raise ValueError(f"{field_name} entries must not be blank or contain NUL")
+    if "\\" in path:
+        raise ValueError(
+            f"{field_name} entries must use '/' separators, not backslashes: {path!r}"
+        )
+    if path.startswith("/"):
+        raise ValueError(f"{field_name} entries must be relative to the worktree root: {path!r}")
+    components = path.split("/")
+    if any(component in {".", ".."} for component in components):
+        raise ValueError(
+            f"{field_name} entries must not contain '.' or '..' components: {path!r}"
+        )
+    if any(not component for component in components):
+        raise ValueError(
+            f"{field_name} entries must be normalized (no duplicate or trailing '/'): {path!r}"
+        )
+
+
+def _coerce_string_tuple(value: object) -> object:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(cast(Sequence[object], value))
+    return value
 
 
 def _coerce_agent_command_config(value: object) -> object:
